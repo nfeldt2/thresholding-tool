@@ -1,157 +1,311 @@
 # src/app.py
 import dash
 from dash import dcc, html
-from dash.dependencies import Input, Output, State
+from dash.dependencies import Input, Output, State, ALL
 import plotly.express as px
 import numpy as np
 import SimpleITK as sitk
 import os
+from uuid import uuid4
+import dash_bootstrap_components as dbc
+import json
+import functools
 
-# Initialize the Dash app
-app = dash.Dash(__name__)
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
-# Paths to the data
-# Adjust these paths based on your directory structure
-ct_volume_path = './CTA_Nathan/1056698'  # Path to DICOM series
-lung_mask_path = './Lung_Masks/1056698_mask.nii.gz'  # Path to lung mask
-
-# Load the CT volume (DICOM series)
-reader = sitk.ImageSeriesReader()
-dicom_names = reader.GetGDCMSeriesFileNames(ct_volume_path)
-reader.SetFileNames(dicom_names)
-full_volume_itk = reader.Execute()
-
-# Load the lung mask
-mask_itk = sitk.ReadImage(lung_mask_path)
-lung_mask = sitk.GetArrayFromImage(mask_itk)
-
-# Convert CT volume to NumPy array
-ct_volume = sitk.GetArrayFromImage(full_volume_itk)
-
-# Get dimensions
-z_dim, y_dim, x_dim = ct_volume.shape
-
-# Initialize global variable to store the modified mask
-# Note: Using a global variable is suitable for single-user, local environments
+# --------------------------------------------------------------------------
+# Global variables and data
+current_scan_id = None
+ct_volume = None
+lung_mask = None
+mask_itk = None
+z_dim = None
+y_dim = None
+x_dim = None
 modified_mask_global = None
+previous_trigger = None
 
-# Define the layout of the app
+region_colors = [
+    [0.5, 0.5, 0],   # Dark yellowish
+    [0, 1, 1],       # Cyan
+    [1, 0.5, 0],     # Orange
+    [0.5, 0, 0.5],   # Purple
+    [0, 0.5, 0.5],   # Teal
+]
+default_region_threshold = -720
+
+def log_callback(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Retrieve the current callback context
+        ctx = dash.callback_context
+
+        if not ctx.triggered:
+            trigger = "No trigger"
+        else:
+            # Get the ID of the component that triggered the callback
+            trigger = ctx.triggered[0]['prop_id'].split('.')[0]
+
+        # Log the callback invocation details
+        print(f"\n[Callback Triggered] Function: {func.__name__}")
+        print(f"Triggered by: {trigger}")
+        print(f"Inputs: {args}")
+        print(f"States: {kwargs}")
+
+        # Execute the original callback function
+        result = func(*args, **kwargs)
+
+        print(f"[Callback Completed] Function: {func.__name__}\n")
+        return result
+    return wrapper
+
+def get_next_region_color(num_regions):
+    idx = num_regions % len(region_colors)
+    return region_colors[idx]
+
+def load_scan_data(scan_id):
+    global ct_volume, lung_mask, mask_itk, z_dim, y_dim, x_dim, current_scan_id, modified_mask_global
+    if scan_id == current_scan_id:
+        return
+
+    ct_volume_path = f'../CTA_Nathan/{scan_id}'
+    lung_mask_path = f'../Lung_Masks/{scan_id}_mask.nii.gz'
+
+    reader = sitk.ImageSeriesReader()
+    dicom_names = reader.GetGDCMSeriesFileNames(ct_volume_path)
+    reader.SetFileNames(dicom_names)
+    full_volume_itk = reader.Execute()
+
+    mask_itk_local = sitk.ReadImage(lung_mask_path)
+    lung_mask_local = sitk.GetArrayFromImage(mask_itk_local)
+    ct_volume_local = sitk.GetArrayFromImage(full_volume_itk)
+
+    ct_volume = ct_volume_local
+    lung_mask = lung_mask_local
+    mask_itk = mask_itk_local
+    z_dim, y_dim, x_dim = ct_volume.shape
+    current_scan_id = scan_id
+    modified_mask_global = None
+    previous_region_thresholds = None
+
+# input your own path to the data
+def get_available_scans():
+    base_dir = '../CTA_Nathan'
+    candidates = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    scans = []
+    for c in candidates:
+        mask_path = f'../Lung_Masks/{c}_mask.nii.gz'
+        if os.path.exists(mask_path):
+            scans.append(c)
+    try:
+        scans_sorted = sorted(scans, key=lambda x: int(x))
+    except ValueError:
+        scans_sorted = sorted(scans)
+    return scans_sorted
+
+available_scans = get_available_scans()
+if not available_scans:
+    raise RuntimeError("No scans found.")
+
 app.layout = html.Div([
     html.H1('Lung Lobe Threshold Adjustment'),
 
-    # Graph to display the image
+
+    html.Div([
+        html.Label('Select Scan'),
+        dcc.Dropdown(
+            id='scan-selection',
+            options=[{'label': s, 'value': s} for s in available_scans],
+            value=available_scans[0],
+            clearable=False
+        ),
+    ], style={'margin-top': '10px'}),
     dcc.Graph(id='ct-image'),
 
-    # Controls (View selection, Slice index, and Threshold inputs)
+    # html.Div([
+    #    dcc.Checklist(
+    #        id='enable-drawing',
+    #        options=[{'label': 'Enable Region Drawing', 'value': 'enable'}],
+    #        value=[]
+    #    ),
+    #    dcc.Graph(id='ct-image', config={'modeBarButtonsToAdd': ['drawrect']}),
+    #], style={'margin-top': '10px'}),
+
     html.Div([
-        # View Selection Dropdown
-        html.Div([
-            html.Label('View'),
-            dcc.Dropdown(
-                id='view-selection',
-                options=[
-                    {'label': 'Axial', 'value': 'axial'},
-                    {'label': 'Coronal', 'value': 'coronal'},
-                    {'label': 'Sagittal', 'value': 'sagittal'}
-                ],
-                value='axial',
-                clearable=False
-            ),
-        ], style={'margin-top': '10px'}),
+        html.Label('View'),
+        dcc.Dropdown(
+            id='view-selection',
+            options=[
+                {'label': 'Axial', 'value': 'axial'},
+                {'label': 'Coronal', 'value': 'coronal'},
+                {'label': 'Sagittal', 'value': 'sagittal'}
+            ],
+            value='axial',
+            clearable=False
+        ),
+    ], style={'margin-top': '10px'}),
 
-        # Slice Index Slider
-        html.Div([
-            html.Label('Slice Index'),
-            dcc.Slider(
-                id='slice-index',
-                min=0,
-                max=z_dim - 1,
-                step=1,
-                value=z_dim // 2,
-                marks={i: str(i) for i in range(0, z_dim, max(1, z_dim // 10))},
-                updatemode='drag',  # Update continuously as the slider is dragged
-            ),
-        ], style={'margin-top': '10px'}),
+    html.Div([
+        html.Label('Slice Index'),
+        dcc.Slider(
+            id='slice-index',
+            min=0,
+            max=0,
+            step=1,
+            value=0,
+            marks={},
+            updatemode='drag',
+        ),
+    ], style={'margin-top': '10px'}),
 
-        # Threshold Inputs for Each Lobe
-        html.Div([
-            html.Label('Left Upper Lobe Threshold'),
-            dcc.Input(
-                id='threshold-lul',
-                type='number',
-                min=-1000,
-                max=0,
-                step=10,
-                value=-720,
-            ),
-        ], style={'margin-top': '10px'}),
+    # Lobe thresholds
+    html.Div([
+        html.Label('Left Upper Lobe Threshold'),
+        dcc.Input(
+            id='threshold-lul',
+            type='number',
+            min=-1000,
+            max=0,
+            step=5,
+            value=-720,
+        ),
+    ], style={'margin-top': '10px'}),
 
-        html.Div([
-            html.Label('Left Lower Lobe Threshold'),
-            dcc.Input(
-                id='threshold-lll',
-                type='number',
-                min=-1000,
-                max=0,
-                step=10,
-                value=-720,
-            ),
-        ], style={'margin-top': '10px'}),
+    html.Div([
+        html.Label('Left Lower Lobe Threshold'),
+        dcc.Input(
+            id='threshold-lll',
+            type='number',
+            min=-1000,
+            max=0,
+            step=5,
+            value=-720,
+        ),
+    ], style={'margin-top': '10px'}),
 
-        html.Div([
-            html.Label('Right Upper Lobe Threshold'),
-            dcc.Input(
-                id='threshold-rul',
-                type='number',
-                min=-1000,
-                max=0,
-                step=10,
-                value=-720,
-            ),
-        ], style={'margin-top': '10px'}),
+    html.Div([
+        html.Label('Right Upper Lobe Threshold'),
+        dcc.Input(
+            id='threshold-rul',
+            type='number',
+            min=-1000,
+            max=0,
+            step=5,
+            value=-720,
+        ),
+    ], style={'margin-top': '10px'}),
 
-        html.Div([
-            html.Label('Right Middle Lobe Threshold'),
-            dcc.Input(
-                id='threshold-rml',
-                type='number',
-                min=-1000,
-                max=0,
-                step=10,
-                value=-720,
-            ),
-        ], style={'margin-top': '10px'}),
+    html.Div([
+        html.Label('Right Middle Lobe Threshold'),
+        dcc.Input(
+            id='threshold-rml',
+            type='number',
+            min=-1000,
+            max=0,
+            step=5,
+            value=-720,
+        ),
+    ], style={'margin-top': '10px'}),
 
-        html.Div([
-            html.Label('Right Lower Lobe Threshold'),
-            dcc.Input(
-                id='threshold-rll',
-                type='number',
-                min=-1000,
-                max=0,
-                step=10,
-                value=-720,
-            ),
-        ], style={'margin-top': '10px'}),
-    ], style={'margin-top': '20px'}),
+    html.Div([
+        html.Label('Right Lower Lobe Threshold'),
+        dcc.Input(
+            id='threshold-rll',
+            type='number',
+            min=-1000,
+            max=0,
+            step=5,
+            value=-720,
+        ),
+    ], style={'margin-top': '10px'}),
 
-    # Save Button
+    # User-defined region thresholds container
+    #html.Div(id='user-regions-container', style={'margin-top': '20px'}),
+
+    # Save button and message
     html.Button('Save Mask', id='save-button', n_clicks=0, style={'margin-top': '20px'}),
-
-    # Message Output
     html.Div(id='save-message', style={'margin-top': '10px', 'color': 'green'}),
 
+    # Store to hold user-defined regions data
+    #dcc.Store(id='user-defined-regions-store', data=[]),
+    # Store to hold how many shapes have been processed into regions
+    #dcc.Store(id='processed-shapes-count', data=0),
 ], style={'width': '80%', 'margin': '0 auto'})
 
-# Callback to update the slice index slider based on the selected view
+
+def get_slice_indices(view, slice_idx):
+    if view == 'axial':
+        return (slice_idx, slice(None), slice(None)), ('z','y','x')
+    elif view == 'coronal':
+        return (slice(None), slice_idx, slice(None)), ('z','y','x')
+    elif view == 'sagittal':
+        return (slice(None), slice(None), slice_idx), ('z','y','x')
+    else:
+        return (slice_idx, slice(None), slice(None)), ('z','y','x')
+
+def transform_coords_to_volume(view, x_range, y_range, slice_idx):
+    if view == 'axial':
+        return {
+            'z_min': slice_idx,
+            'z_max': slice_idx,
+            'y_min': int(min(y_range)),
+            'y_max': int(max(y_range)),
+            'x_min': int(min(x_range)),
+            'x_max': int(max(x_range))
+        }
+    elif view == 'coronal':
+        return {
+            'z_min': int(min(y_range)),
+            'z_max': int(max(y_range)),
+            'y_min': slice_idx,
+            'y_max': slice_idx,
+            'x_min': int(min(x_range)),
+            'x_max': int(max(x_range))
+        }
+    elif view == 'sagittal':
+        return {
+            'z_min': int(min(y_range)),
+            'z_max': int(max(y_range)),
+            'y_min': int(min(x_range)),
+            'y_max': int(max(x_range)),
+            'x_min': slice_idx,
+            'x_max': slice_idx
+        }
+
+def generate_region_inputs(regions):
+    inputs = []
+    print("CREATING INPUTS")
+    for i, r in enumerate(regions):
+        print(f"Region {i+1} Threshold: {r['threshold']}")
+
+        # check if the region threshold has been changed
+
+
+        inputs.append(html.Div([
+            html.Label(f"Region {i+1} Threshold"),
+            dcc.Input(
+                id={'type': 'region-threshold-input', 'index': r['id']},
+                type='number',
+                min=-1000, max=0, step=10,
+                value=r['threshold'],
+            )
+        ], style={
+            'margin-top': '10px',
+            'color': f"rgb({int(r['color'][0]*255)}, {int(r['color'][1]*255)}, {int(r['color'][2]*255)})"
+        }))
+    return inputs
+
 @app.callback(
     Output('slice-index', 'max'),
     Output('slice-index', 'marks'),
     Output('slice-index', 'value'),
     Input('view-selection', 'value'),
+    Input('scan-selection', 'value'),
     State('slice-index', 'value')
 )
-def update_slice_index(view, current_slice_idx):
+@log_callback
+def update_slice_index(view, scan_id, current_slice_idx):
+    load_scan_data(scan_id)
     if view == 'axial':
         max_idx = z_dim - 1
     elif view == 'coronal':
@@ -159,19 +313,27 @@ def update_slice_index(view, current_slice_idx):
     elif view == 'sagittal':
         max_idx = x_dim - 1
     else:
-        max_idx = z_dim - 1  # Default to axial if view is not recognized
+        max_idx = z_dim - 1
 
-    # Adjust the current slice index if it's out of bounds
     if current_slice_idx > max_idx:
         current_slice_idx = max_idx
 
-    # Update the slider marks
-    step = max(1, max_idx // 10)
+    step = max(1, max_idx // 10) if max_idx >= 10 else 1
     marks = {i: str(i) for i in range(0, max_idx + 1, step)}
-
     return max_idx, marks, current_slice_idx
 
-# Main callback to update the image and store the modified mask
+
+
+'''@app.callback(
+        Output('user-defined-regions-store', 'data'),
+        Input({'type': 'region-threshold-input', 'index': ALL}, 'value'),
+)
+def update_region_thresholds(region_thresholds):
+    #regions = json.loads(dash.callback_context.states['user-defined-regions-store']['data'])
+    for i, r in enumerate(regions):
+        r['threshold'] = region_thresholds[i]
+    return regions'''
+
 @app.callback(
     Output('ct-image', 'figure'),
     [
@@ -182,142 +344,106 @@ def update_slice_index(view, current_slice_idx):
         Input('threshold-rll', 'value'),
         Input('slice-index', 'value'),
         Input('view-selection', 'value'),
+        Input('scan-selection', 'value'),
+        #Input('user-defined-regions-store', 'data'),  # Now an Input instead of State
+        #State('enable-drawing', 'value')
     ]
 )
-def update_image(th_lul, th_lll, th_rul, th_rml, th_rll, slice_idx, view):
-    global modified_mask_global  # Access the global variable
+@log_callback
+def update_image(th_lul, th_lll, th_rul, th_rml, th_rll, slice_idx, view, scan_id):
+    load_scan_data(scan_id)
+    thresholds = {1: th_lul, 2: th_lll, 3: th_rul, 4: th_rml, 5: th_rll}
+        
 
-    thresholds = {
-        1: th_lul,  # Left Upper Lobe
-        2: th_lll,  # Left Lower Lobe
-        3: th_rul,  # Right Upper Lobe
-        4: th_rml,  # Right Middle Lobe
-        5: th_rll,  # Right Lower Lobe
-    }
-
-    # Create a modified mask based on thresholds
+    # Create modified mask
     modified_mask = np.zeros_like(lung_mask, dtype=np.uint8)
+    
+        
+    # Apply lobe thresholds
     for lobe_label, threshold in thresholds.items():
         if threshold is None:
-            continue  # Skip if no threshold value
+            continue
         lobe_mask = (lung_mask == lobe_label)
         lobe_ct = ct_volume.copy()
-        lobe_ct[~lobe_mask] = -2000  # Exclude other lobes
+        lobe_ct[~lobe_mask] = -2000
         lobe_mask &= (lobe_ct <= threshold)
-        modified_mask[lobe_mask] = lobe_label  # Keep label for visualization
+        modified_mask[lobe_mask] = lobe_label
 
-    # Update the global variable
+    global modified_mask_global
     modified_mask_global = modified_mask.copy()
 
-    # Extract the desired slice based on the selected view
-    if view == 'axial':
-        ct_slice = ct_volume[slice_idx, :, :]
-        mask_slice = modified_mask[slice_idx, :, :]
-        # No need to transpose or rotate
-    elif view == 'coronal':
-        ct_slice = ct_volume[:, slice_idx, :]
-        mask_slice = modified_mask[:, slice_idx, :]
-        # Transpose and rotate to orient the image correctly
-        ct_slice = np.rot90(np.transpose(ct_slice, (1, 0)), k=1)
-        mask_slice = np.rot90(np.transpose(mask_slice, (1, 0)), k=1)
-    elif view == 'sagittal':
-        ct_slice = ct_volume[:, :, slice_idx]
-        mask_slice = modified_mask[:, :, slice_idx]
-        # Transpose and rotate to orient the image correctly
-        ct_slice = np.rot90(np.transpose(ct_slice, (1, 0)), k=1)
-        mask_slice = np.rot90(np.transpose(mask_slice, (1, 0)), k=1)
-    else:
-        # Default to axial view
-        ct_slice = ct_volume[slice_idx, :, :]
-        mask_slice = modified_mask[slice_idx, :, :]
+    slice_indices, axis_order = get_slice_indices(view, slice_idx)
+    ct_slice = ct_volume[slice_indices]
+    mask_slice = modified_mask[slice_indices]
 
-    # Normalize the CT image for display
+    if view == 'coronal' or view == 'sagittal':
+        ct_slice = np.rot90(np.transpose(ct_slice, (1,0)), k=1)
+        mask_slice = np.rot90(np.transpose(mask_slice, (1,0)), k=1)
+
     ct_image = np.clip((ct_slice + 1000) / 2000, 0, 1)
+    overlay = np.zeros(ct_image.shape + (3,), dtype=np.float32)
 
-    # Prepare the overlay with different colors for each lobe
+    # Colors for lobes
     colors = {
-        1: [1, 0, 0],    # Red
-        2: [0, 1, 0],    # Green
-        3: [0, 0, 1],    # Blue
-        4: [1, 1, 0],    # Yellow
-        5: [1, 0, 1],    # Magenta
+        1: [1, 0, 0],
+        2: [0, 1, 0],
+        3: [0, 0, 1],
+        4: [1, 1, 0],
+        5: [1, 0, 1],
     }
 
-    overlay = np.zeros(ct_image.shape + (3,), dtype=np.float32)  # RGB image
-    for lobe_label, color in colors.items():
-        overlay[mask_slice == lobe_label] = color
 
-    # Combine the CT image and the overlay
+
+    for lbl, clr in colors.items():
+        overlay[mask_slice == lbl] = clr
+
     alpha = 0.3
     combined_image = (1 - alpha) * np.stack([ct_image]*3, axis=-1) + alpha * overlay
 
-    # Create the figure using Plotly
     fig = px.imshow(combined_image)
     fig.update_layout(
-        coloraxis_showscale=False,
         margin=dict(l=0, r=0, t=40, b=0),
-        title=f'View: {view.capitalize()}, Slice Index: {slice_idx}',
+        title=f'Scan: {scan_id}, View: {view.capitalize()}, Slice Index: {slice_idx}',
         xaxis=dict(showticklabels=False),
         yaxis=dict(showticklabels=False),
-        height=800,  # Increase the height of the image
+        height=800,
     )
     fig.update_xaxes(showticklabels=False)
     fig.update_yaxes(showticklabels=False)
+    fig.update_layout(dragmode='zoom')
 
-    # Enable zooming and panning
     fig.update_layout(
-        dragmode='zoom',  # Default drag mode is zoom
-    )
-    fig.update_layout(
-        xaxis=dict(
-            scaleanchor='y',
-            scaleratio=1,
-        ),
-        yaxis=dict(
-            constrain='domain',
-        )
+        dragmode='zoom',
+        shapes=[]
     )
 
     return fig
 
-# Callback to handle the save button click
 @app.callback(
     Output('save-message', 'children'),
     Input('save-button', 'n_clicks'),
+    State('scan-selection', 'value'),
 )
-def save_mask(n_clicks):
+@log_callback
+def save_mask(n_clicks, scan_id):
     if n_clicks > 0:
-        if modified_mask_global is not None:
-            # Define the output directory
-            output_dir = '../thresholded_masks'  # Adjust the path if necessary
-
-            # Check if the directory exists; if not, create it
+        if modified_mask_global is not None and scan_id is not None:
+            output_dir = '../thresholded_masks'
             if not os.path.exists(output_dir):
                 try:
                     os.makedirs(output_dir)
                 except Exception as e:
                     return f'Error creating directory: {e}'
 
-            # Convert the modified mask to binary (0 and 1)
+            # Convert to binary mask (1 for inside, 0 outside)
             binary_mask = np.where(modified_mask_global > 0, 1, 0).astype(np.uint8)
-
-            # Convert the binary mask to SimpleITK Image
             binary_mask_itk = sitk.GetImageFromArray(binary_mask)
-
-            # Copy spatial metadata from the original mask
             binary_mask_itk.CopyInformation(mask_itk)
 
-            # Generate the output filename
-            original_mask_filename = os.path.basename(lung_mask_path)
-            filename_wo_ext = os.path.splitext(original_mask_filename)[0]
-            # Handle double extensions (e.g., .nii.gz)
-            if filename_wo_ext.endswith('.nii'):
-                filename_wo_ext = os.path.splitext(filename_wo_ext)[0]
-            output_filename = f"{filename_wo_ext}_thresholded.nii.gz"
+            output_filename = f"{scan_id}_mask_thresholded.nii.gz"
             output_mask_path = os.path.join(output_dir, output_filename)
 
             try:
-                # Save the binary mask
                 sitk.WriteImage(binary_mask_itk, output_mask_path)
                 return f'Mask saved as {output_mask_path}'
             except Exception as e:
@@ -327,5 +453,8 @@ def save_mask(n_clicks):
     else:
         return ''
     
+
 if __name__ == '__main__':
+    # Pre-load the first scan
+    load_scan_data(available_scans[0])
     app.run_server(debug=True)
