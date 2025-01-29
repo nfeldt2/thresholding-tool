@@ -24,6 +24,7 @@ y_dim = None
 x_dim = None
 modified_mask_global = None
 previous_trigger = None
+dicom_IDs = []
 
 region_colors = [
     [0.5, 0.5, 0],   # Dark yellowish
@@ -64,21 +65,39 @@ def get_next_region_color(num_regions):
     return region_colors[idx]
 
 def load_scan_data(scan_id):
-    global ct_volume, lung_mask, mask_itk, z_dim, y_dim, x_dim, current_scan_id, modified_mask_global
+    global ct_volume, lung_mask, mask_itk, z_dim, y_dim, x_dim, current_scan_id, modified_mask_global, dicom_IDs
     if scan_id == current_scan_id:
         return
 
-    ct_volume_path = f'../CTA_Nathan/{scan_id}'
-    lung_mask_path = f'../Lung_Masks/{scan_id}_mask.nii.gz'
+    ct_volume_path = f'../CTA_Nathan/'
+    lung_mask_path = f'../Lung_Masks/'
 
-    reader = sitk.ImageSeriesReader()
-    dicom_names = reader.GetGDCMSeriesFileNames(ct_volume_path)
-    reader.SetFileNames(dicom_names)
-    full_volume_itk = reader.Execute()
+    #check if the ct_volume candidates are dicom or nifti
+    if os.path.exists(ct_volume_path+scan_id+'.nii.gz'):
+        ct_volume_local = sitk.GetArrayFromImage(sitk.ReadImage(ct_volume_path+scan_id+'.nii.gz'))
+    elif os.path.exists(ct_volume_path+scan_id):
+        ct_volume_path = ct_volume_path+scan_id
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(ct_volume_path)
+        reader.SetFileNames(dicom_names)
+        full_volume_itk = reader.Execute()
+        ct_volume_local = sitk.GetArrayFromImage(full_volume_itk)
+        if dicom_IDs is None:
+            # get only number value from the dicom_IDs
+            dicom_IDs = [int(''.join(filter(str.isdigit, ct_volume_path)))]
+        else:
+            dicom_IDs.append(int(''.join(filter(str.isdigit,ct_volume_path))))
 
-    mask_itk_local = sitk.ReadImage(lung_mask_path)
-    lung_mask_local = sitk.GetArrayFromImage(mask_itk_local)
-    ct_volume_local = sitk.GetArrayFromImage(full_volume_itk)
+    # how do you check if a file is there?
+    # check if the file exists
+    if os.path.isfile(lung_mask_path+scan_id+'_mask.nii.gz'):
+        print('occured')
+        lung_mask_local = sitk.GetArrayFromImage(sitk.ReadImage(lung_mask_path+scan_id+'_mask.nii.gz'))
+        mask_itk_local = sitk.GetImageFromArray(lung_mask_local)
+    if os.path.isfile(lung_mask_path+scan_id+'_lungsegm.nii.gz'):
+        lung_mask_path = lung_mask_path+scan_id+'_lungsegm.nii.gz'
+        lung_mask_local = sitk.GetArrayFromImage(sitk.ReadImage(lung_mask_path))
+        mask_itk_local = sitk.GetImageFromArray(lung_mask_local)
 
     ct_volume = ct_volume_local
     lung_mask = lung_mask_local
@@ -91,16 +110,29 @@ def load_scan_data(scan_id):
 # input your own path to the data
 def get_available_scans():
     base_dir = '../CTA_Nathan'
-    candidates = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    candidates = [d for d in os.listdir(base_dir) if os.path.isfile(os.path.join(base_dir, d)) or os.path.isdir(os.path.join(base_dir, d))]
+    cleaned_names = list(set(''.join(char for char in filename if char.isdigit()) for filename in candidates))
+    if '' in cleaned_names:
+        cleaned_names.remove('')
+    print(candidates)
+    print(cleaned_names)
+
     scans = []
-    for c in candidates:
+    for c in cleaned_names:
         mask_path = f'../Lung_Masks/{c}_mask.nii.gz'
+        alter_mask_path = f'../Lung_Masks/{c}_lungsegm.nii.gz'
+        # list dir of ../lung_masks
+
         if os.path.exists(mask_path):
+            scans.append(c)
+        elif os.path.exists(alter_mask_path):
             scans.append(c)
     try:
         scans_sorted = sorted(scans, key=lambda x: int(x))
     except ValueError:
         scans_sorted = sorted(scans)
+    
+    print(scans)
     return scans_sorted
 
 available_scans = get_available_scans()
@@ -426,6 +458,27 @@ def update_image(th_lul, th_lll, th_rul, th_rml, th_rll, slice_idx, view, scan_i
 )
 @log_callback
 def save_mask(n_clicks, scan_id):
+    global dicom_IDs
+    print("dicom_IDs: ", dicom_IDs)
+    print("scan_id: ", scan_id)
+    print(int(scan_id) in dicom_IDs)
+    if int(scan_id) in dicom_IDs:
+        # save file as nifti file
+        save_dir = '../CTA_Nathan'
+        print(os.path.exists(save_dir))
+        if os.path.exists(save_dir):
+            # save ct_volume as nifti file
+            # convert to itk image
+            itk_image = sitk.GetImageFromArray(ct_volume)
+            # copy information from the original image
+            itk_image.SetOrigin(mask_itk.GetOrigin())
+            itk_image.SetSpacing(mask_itk.GetSpacing())
+            itk_image.SetDirection(mask_itk.GetDirection())
+            # save the image
+            sitk.WriteImage(itk_image, os.path.join(save_dir, f'{scan_id}.nii.gz'))
+            print('Image saved successfully.')
+
+
     if n_clicks > 0:
         if modified_mask_global is not None and scan_id is not None:
             output_dir = '../thresholded_masks'
